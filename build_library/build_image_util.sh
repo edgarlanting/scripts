@@ -273,6 +273,65 @@ write_packages() {
     image_packages "$1" | sort > "$2"
 }
 
+# Get metadata $key for package $pkg installed under $prefix
+# The metadata is either read from the portage db folder or
+# via a portageq-BOARD invocation. In cases where SRC_URI is
+# not used for the package, fallback mechanisms are used to find
+# the source URL. Mirror names are replaced with the mirror URLs.
+get_metadata() {
+    local prefix="$1"
+    local pkg="$2"
+    local key="$3"
+    local path="${prefix}/var/db/pkg/${pkg%%:*}/${key}"
+    local val
+    if [[ -f "$path" ]]; then
+        val="$(< $path)"
+    else
+        # The package is not installed in $prefix or $key not exposed as file,
+        # so get the value from its ebuild
+        val=$(portageq-${BOARD} metadata "${BOARD_ROOT}" ebuild \
+                    "${pkg%%:*}" "${key}" 2>/dev/null ||:)
+    fi
+    # The value that portageq reports is not a valid URL because it uses a special mirror format.
+    # Also the value can be empty and fallback methods have to be used.
+    if [ "${key}" = "SRC_URI" ]; then
+        local package_name="$(echo "${pkg%%:*}" | cut -d / -f 2)"
+        local ebuild_path="${prefix}/var/db/pkg/${pkg%%:*}/${package_name}.ebuild"
+        # SRC_URI is empty for the special github.com/flatcar-linux projects
+        if [ -z "${val}" ]; then
+            # The grep invocation gives errors when the ebuild file is not present.
+            # This can happen if a "scripts" branch does not match the "coreos-overlay" branch
+            # or when the binary packages from ./build_packages are outdated.
+            val="$(grep "CROS_WORKON_PROJECT=" "${ebuild_path}" | cut -d '"' -f 2)"
+            if [ -n "${val}" ]; then
+                val="https://github.com/${val}"
+            fi
+        fi
+        # During development "portageq-BOARD metadata ... ebuild ..." may result in the package not being found, fall back to a parameterized URL
+        if [ -z "${val}" ]; then
+            # Do not attempt to postprocess by resolving ${P} and friends because it does not affect production images
+            val="$(cat "${ebuild_path}" | tr '\n' ' ' | grep -P -o 'SRC_URI=".*?"' | cut -d '"' -f 2)"
+        fi
+        # Some packages use nothing from the above but EGIT_REPO_URI (currently only app-crypt/go-tspi)
+        if [ -z "${val}" ]; then
+            val="$(grep "EGIT_REPO_URI=" "${ebuild_path}" | cut -d '"' -f 2)"
+        fi
+        # Replace all mirror://MIRRORNAME/ parts with the actual URL prefix of the mirror
+        new_val=""
+        for v in ${val}; do
+            local mirror="$(echo "${v}" | grep mirror:// | cut -d '/' -f 3)"
+            if [ -n "${mirror}" ]; then
+                # Take only first mirror, those not working should be removed
+                local location="$(grep "^${mirror}"$'\t' /var/gentoo/repos/gentoo/profiles/thirdpartymirrors | cut -d $'\t' -f 2- | cut -d ' ' -f 1 | tr -d $'\t')"
+                v="$(echo "${v}" | sed "s#mirror://${mirror}/#${location}#g")"
+            fi
+            new_val+="${v} "
+        done
+        val="${new_val}"
+    fi
+    echo "${val}"
+}
+
 # Generate a list of packages w/ their licenses in the format:
 #   [
 #     {
@@ -291,19 +350,10 @@ write_licenses() {
             continue
         fi
 
-        local path="$1/var/db/pkg/${pkg%%:*}/LICENSE"
-        local lic_str
-        if [[ -f "$path" ]]; then
-            lic_str="$(< $path)"
-        else
-            # The package is not installed in $1 so get the license from
-            # its ebuild
-            lic_str=$(portageq-${BOARD} metadata "${BOARD_ROOT}" ebuild \
-                        "${pkg%%:*}" LICENSE 2>/dev/null ||:)
-            if [[ -z "$lic_str" ]]; then
+        local lic_str="$(get_metadata "$1" "${pkg}" LICENSE)"
+        if [[ -z "$lic_str" ]]; then
                 warn "No license found for ${pkg}"
                 continue
-            fi
         fi
 
         [[ -n $pkg_sep ]] && echo ","
@@ -335,6 +385,12 @@ write_licenses() {
         # Remove duplicate licenses
         local lics=$(tr ' ' '\n' <<< "${req_lics[*]} ${opt_lic}" | sort --unique | tr '\n' ' ')
 
+        local homepage="$(get_metadata "$1" "${pkg}" HOMEPAGE)"
+        local description="$(get_metadata "$1" "${pkg}" DESCRIPTION)"
+        local src_uri="$(get_metadata "$1" "${pkg}" SRC_URI)"
+        # Filter out directories, cut type marker, quote "\", and convert line breaks to "\n"
+        local files="$(get_metadata "$1" "${pkg}" CONTENTS | grep -v '^dir ' | cut -d ' ' -f 2- | sed 's#\\#\\\\#g' | tr '\n' '*' | sed 's/*/\\n/g')"
+
         echo -n "  {\"project\": \"${pkg}\", \"licenses\": ["
 
         local lic_sep=""
@@ -345,10 +401,41 @@ write_licenses() {
             echo -n "\"${lic}\""
         done
 
-        echo -n "]}"
+        echo -n "], \"description\": \"${description}\", \"homepage\": \"${homepage}\", \"source\": \"${src_uri}\", \"files\": \"${files}\"}"
     done >> "$2"
 
     echo -e "\n]" >> "$2"
+}
+
+# Convert the license JSON to a text format and store it and all licenses in the rootfs.
+# The generation of the metadata in write_licenses takes a while because the invocation of the portage wrapper
+# is slow etc., thus, just reuse the JSON data which is also convenient with "jq" string substitution.
+insert_licenses() {
+    local json_input="$1"
+    local root_fs_dir="$2"
+    local output="${root_fs_dir}"/usr/share/licenses/INFO
+    sudo mkdir -p "${root_fs_dir}"/usr/share/licenses/common
+    echo "Flatcar Container Linux distributes software from various projects." | sudo_clobber "${output}"
+    echo "The following list of projects shows their licenses, how to obtain the source code," | sudo_append "${output}"
+    echo "and which binary files in Flatcar Container Linux were created from it." | sudo_append "${output}"
+    echo "The license texts are available under /usr/share/licenses/common/ (read with \"less NAME.gz\")." | sudo_append "${output}"
+    echo "Build system files and patches used to build these projects are located at:" | sudo_append "${output}"
+    echo "https://github.com/flatcar-linux/coreos-overlay/" | sudo_append "${output}"
+    echo "https://github.com/flatcar-linux/portage-stable/" | sudo_append "${output}"
+    echo "https://github.com/flatcar-linux/scripts/" | sudo_append "${output}"
+    echo "Information on how to build Flatcar Container Linux can be found under:" | sudo_append "${output}"
+    echo "https://docs.flatcar-linux.org/os/sdk-modifying-flatcar/" | sudo_append "${output}"
+    echo | sudo_append "${output}"
+    jq -r '.[] | "\(.project):\nDescription: \(.description)\nLicenses: \(.licenses)\nHomepage: \(.homepage)\nSource code: \(.source)\nFiles:\n\(.files)\n"' \
+        "${json_input}" | sudo_append "${output}"
+    # Compress the file from 2.1 MB to 0.39 MB; reading with "less INFO.bz2" works on Flatcar
+    sudo lbzip2 -9 "${output}"
+    # Copy all needed licenses to a "common" subdirectory and compress them
+    local license_list # define before assignment because it would mask any error
+    license_list="$(jq -r '.[] | "/var/gentoo/repos/gentoo/licenses/\(.licenses | .[])"' "${json_input}" | sort | uniq)"
+    sudo cp ${license_list} "${root_fs_dir}"/usr/share/licenses/common/
+    # Compress the licenses just with gzip because there is no big difference as they are single files
+    sudo gzip -9 "${root_fs_dir}"/usr/share/licenses/common/*
 }
 
 # Add an entry to the image's package.provided
