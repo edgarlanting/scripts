@@ -405,6 +405,8 @@ write_licenses() {
     done >> "$2"
 
     echo -e "\n]" >> "$2"
+    mv "$2" "$2".tmp
+    jq . "$2".tmp > "$2"
 }
 
 # Convert the license JSON to a text format and store it and all licenses in the rootfs.
